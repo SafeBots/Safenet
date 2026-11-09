@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.0-yellow.svg)](package.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-green.svg)](package.json)
-[![Tests](https://img.shields.io/badge/tests-159%20passing-brightgreen.svg)](test/testSafenet.js)
+[![Tests](https://img.shields.io/badge/tests-210%20passing-brightgreen.svg)](test/)
 
 **Trust network protocol for Safebox-to-Safebox communication, distributed package management, and payment settlement.**
 
@@ -19,6 +19,7 @@ Safenet is the protocol layer that lets Safeboxes trust each other, distribute s
 - [What Safenet Does](#what-safenet-does)
 - [Architecture](#architecture)
 - [Safecloud Integration](#safecloud-integration)
+- [DNS Nameserver](#dns-nameserver)
 - [Interfaces](#interfaces)
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
@@ -38,28 +39,28 @@ The Safebots ecosystem is four repos, each with a single job:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Safebots Ecosystem                           │
 │                                                                     │
-│       ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│       │   Safecloud  │  │   Safenet    │  │   Safebox    │          │
-│       │              │  │  (this repo) │  │              │          │
-│       │  Encrypted   │  │  Trust &     │  │  Governed    │          │
-│       │  chunk       │  │  registry &  │  │  AI workflow │          │
-│       │  storage     │  │  package     │  │  engine      │          │
-│       │              │  │  distribution│  │              │          │
-│       │  Jets, Drops │  │  Attestation │  │  Sandbox,    │          │
-│       │  Clouds      │  │  Git/Hg      │  │  governance, │          │
-│       │              │  │  Safebux     │  │  executors   │          │
-│       └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
-│              │                 │                 │                  │
-│              └─────────────────┼─────────────────┘                  │
-│                                │                                    │
-│                       ┌────────┴────────┐                           │
-│                       │ Infrastructure  │                           │
-│                       │                 │                           │
-│                       │ Host-level      │                           │
-│                       │ provisioning &  │                           │
-│                       │ hardening       │                           │
-│                       │ (AWS AMI)       │                           │
-│                       └─────────────────┘                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   Safecloud   │  │   Safenet    │  │   Safebox    │              │
+│  │              │  │  (this repo) │  │              │              │
+│  │  Encrypted   │  │  Trust &     │  │  Governed    │              │
+│  │  chunk       │  │  registry &  │  │  AI workflow │              │
+│  │  storage     │  │  package     │  │  engine      │              │
+│  │              │  │  distribution│  │              │              │
+│  │  Jets, Drops │  │  Attestation │  │  Sandbox,    │              │
+│  │  Clouds      │  │  Git/Hg     │  │  governance, │              │
+│  │              │  │  Safebux     │  │  executors   │              │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
+│         │                 │                 │                       │
+│         └─────────────────┼─────────────────┘                       │
+│                           │                                         │
+│                  ┌────────┴────────┐                                │
+│                  │ Infrastructure  │                                │
+│                  │                 │                                │
+│                  │ Host-level      │                                │
+│                  │ provisioning &  │                                │
+│                  │ hardening       │                                │
+│                  │ (AWS AMI)       │                                │
+│                  └─────────────────┘                                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -105,19 +106,22 @@ safenet/
 │   ├── Discovery.js         # Peer gossip (fanout 6, TTL 8), Bloom filter sync
 │   ├── Payments.js          # Safebux ledger, license grants, EIP-712 settlement
 │   ├── TransparencyLog.js   # Append-only chained Merkle log with consistency proofs
-│   ├── Claims.js            # Factory for all 14 OCP claim types
+│   ├── Verify.js            # Client-side claim verification (isomorphic Node+browser)
+│   ├── Claims.js            # Factory for all 17 OCP claim types (includes name_claim, safebox_announce)
+│   ├── ZoneCompiler.js      # Pure-function DNS zone compiler (registry → zone file)
 │   └── utils.js             # SHA-256, RFC 8785 canonicalization, semver validation
 ├── cli.js                   # 13 CLI commands
 ├── server.js                # Standalone HTTP/HTTPS server
 ├── package.json             # @safenet/protocol v0.1.0
 ├── PROTOCOL.md              # Full protocol specification (939 lines)
 └── test/
-    └── testSafenet.js       # 159 TAP tests (154 run + 5 Q-dependent skipped)
+    ├── testSafenet.js       # 159 TAP tests (154 run + 5 Q-dependent skipped)
+    └── testVerify.js        # 51 TAP tests for Verify library (end-to-end crypto)
 ```
 
 ### Claim Types
 
-Everything in Safenet is an OCP claim — a signed JSON envelope with the wire format `{ocp:1, iss, sub, stm, key:[], sig:[]}`. The protocol defines 14 claim types:
+Everything in Safenet is an OCP claim — a signed JSON envelope with the wire format `{ocp:1, iss, sub, stm, key:[], sig:[]}`. The protocol defines 17 claim types:
 
 | Claim Type | Issuer | Purpose |
 |------------|--------|---------|
@@ -135,6 +139,9 @@ Everything in Safenet is an OCP claim — a signed JSON envelope with the wire f
 | `peer_announce` | Safebox | Announce network presence and endpoints |
 | `trust` | Safebox | Establish a peer trust relationship |
 | `namespace_transfer` | Author/Org | Transfer namespace to a new owner |
+| `audit_attestation` | Auditor | Attest a package meets per-topic audit requirements |
+| `safebox_announce` | Safebox (Ed25519) | Announce box ID, IP, attestation status on boot |
+| `name_claim` | Owner/governance (ES256) | Map a DNS name to a primary + failover box |
 
 Supports ES256 (P-256) and EIP-712 (secp256k1) signing schemes with M-of-N multisignature.
 
@@ -169,7 +176,7 @@ When a package is published to Safenet, the content is encrypted and distributed
 Author pushes v1.2.3              Safenet peer (Git Receiver)
      │                                    │
      │  git push safenet main             │
-     │───────────────────────────────────>│
+     │────────────────────────────────────>│
      │                                    │
      │                    [verify author, namespace, manifest]
      │                    [compute Merkle root]
@@ -226,6 +233,108 @@ Safecloud's protocol doesn't need modification for Safenet integration. Safeclou
 - Peer discovery (JetSwarm)
 
 Safenet adds the layer that Safecloud doesn't have: trust (who can publish), authorization (who can install), and payments (what it costs).
+
+---
+
+## DNS Nameserver
+
+Safenet includes a built-in authoritative DNS nameserver so that names claimed through the registry resolve to the boxes that serve them — with automatic failover and hardware-rooted DNSSEC.
+
+### How It Works
+
+The nameserver architecture has two halves:
+
+1. **Zone Compiler (Safenet)** — A pure function (`lib/ZoneCompiler.js`) that takes the current registry state (name claims + box announces) and produces a standard DNS zone file. Given the same inputs, every nameserver computes the same zone.
+
+2. **Knot DNS (Infrastructure)** — The authoritative nameserver that serves the compiled zone. Runs as a host service on boxes designated with the `safebox-nameserver-role.target`. DNSSEC keys live in the TPM via `tpm2-pkcs11`.
+
+```
+Registry state (Prolly tree)
+  │
+  │  name_claims: "myapp" → box-abc, failover box-xyz
+  │  box_announces: box-abc → 203.0.113.10, attested 30s ago
+  │                 box-xyz → 198.51.100.20, attested 45s ago
+  │
+  ▼
+ZoneCompiler.compile(registry, config)
+  │
+  │  Pure function: same inputs → same zone file
+  │  SOA serial from Prolly tree root hash
+  │
+  ▼
+safenet.org.zone
+  │
+  │  myapp  IN  A  203.0.113.10  ; box-abc
+  │
+  ▼
+Knot DNS (knotc zone-reload)
+  │
+  │  DNSSEC signed with TPM-held keys
+  │
+  ▼
+DNS queries → authoritative answers
+```
+
+### Two-Claim Model
+
+DNS resolution uses two OCP claim types:
+
+| Claim | Issuer | Purpose |
+|-------|--------|---------|
+| `safebox_announce` | Safebox (Ed25519) | "I'm box X at IP Y, attested at time T" — published on every boot and periodically |
+| `name_claim` | Owner/governance (ES256) | "Map `myapp.safenet.org` to box X (failover: box Y)" — signed by the name owner |
+
+Both propagate through the standard gossip protocol. Any party with the registry state can compile the zone independently.
+
+### Automatic Failover
+
+When a box stops attesting (no fresh `safebox_announce` within `attestationMaxAge`, default 600 seconds), the zone compiler automatically switches to the failover box:
+
+- **Primary fresh** → A record points to primary box IP
+- **Primary stale, failover fresh** → A record points to failover box IP
+- **Both stale** → A record points to primary with STALE warning
+- **No box reachable** → OFFLINE comment, no A record
+
+Failover happens within one TTL cycle (default 300s / 5 min). No manual intervention required.
+
+### DNSSEC (RFC 8901 Multi-Signer)
+
+Each nameserver generates its own ZSK and KSK inside its TPM — no shared key material. DS records for all nameservers are registered at the parent (.org registry via PIR). This follows RFC 8901 multi-signer DNSSEC:
+
+- **Algorithm:** ECDSAP256SHA256
+- **KSK lifetime:** Indefinite (TPM-held, rolled manually)
+- **ZSK lifetime:** 30 days (automatic rollover by Knot)
+- **NSEC3:** Enabled (prevents zone walking)
+- **Key storage:** PKCS#11 via `tpm2-pkcs11` — keys never leave the hardware
+
+### CAA Records
+
+The zone includes Certificate Authority Authorization records restricting certificate issuance to configured CAs (default: Let's Encrypt):
+
+```dns
+@  IN  CAA  0 issue "letsencrypt.org"
+@  IN  CAA  0 issuewild "letsencrypt.org"
+@  IN  CAA  0 iodef "mailto:caa@safenet.org"
+```
+
+### Delegation Monitor
+
+A systemd timer (`safebox-delegation-monitor.timer`, every 6 hours) verifies delegation health:
+
+1. NS records at the parent (.org) match expected nameservers
+2. DS records at the parent include all local KSK key tags
+3. All nameservers respond and serve the same serial
+4. Certificate Transparency logs for unexpected certificate issuance
+
+### Independent Verification
+
+Because the zone is a pure function of public registry state, anyone can verify the DNS by:
+
+1. Syncing the registry (Prolly tree)
+2. Running `ZoneCompiler.compile()` with the same config
+3. Comparing the output against what the nameservers actually serve
+
+This makes DNS a transparent, auditable layer — not a trusted authority.
 
 ---
 
@@ -291,6 +400,14 @@ All endpoints are under `/safenet/v1/`. Content type is `application/json`.
 | `POST` | `/pay` | Submit a payment claim |
 | `GET` | `/balance/<author>` | Get Safebux balance |
 | `GET` | `/payments/<author>` | List payment claims for an author |
+
+**Audit Attestation:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/audit` | Submit a signed audit attestation claim |
+| `GET` | `/audit/<topic>` | List all attestations for a topic |
+| `GET` | `/audit/<topic>/<ns>/<pkg>` | Get attestations for a specific package + topic |
 
 **Transparency:**
 
@@ -456,7 +573,7 @@ Authors don't learn a new tool. They `git push` to a Safenet remote. The Git Sma
 
 ### Prolly Tree Registry
 
-The registry is a Prolly tree (probabilistic B-tree, built on `Q.Data.Prolly`) with five key prefixes:
+The registry is a Prolly tree (probabilistic B-tree, built on `Q.Data.Prolly`) with six key prefixes:
 
 ```
 namespace:<name>                → NamespaceClaim
@@ -464,6 +581,7 @@ package:<namespace>/<name>      → PackageMetadata
 version:<namespace>/<name>@<v>  → PublicationClaim
 author:<name>                   → AuthorIdentityClaim
 revocation:<hash>               → RevocationClaim
+audit:<topic>:<auditor>:<ns>/<pkg> → AuditAttestationClaim
 ```
 
 Peers compare Prolly root hashes to detect divergence, then exchange only the subtrees that differ. Sync cost is O(diff × log n), not O(n).
@@ -597,6 +715,68 @@ The governance quorum publishes `image_blessing` claims that approve specific im
 
 ---
 
+## Client-Side Verification
+
+The `Verify` module (`lib/Verify.js`) is a standalone, isomorphic verification library that works in both Node.js (16+) and browsers with **zero Q platform dependency**. It uses the Web Crypto API (SubtleCrypto) for all cryptographic operations.
+
+### Usage
+
+```javascript
+// Node.js
+const Verify = require('@safenet/protocol/verify');
+
+// Browser (ESM)
+import Verify from '@safenet/protocol/lib/Verify.js';
+
+// Verify any signed OCP claim
+const result = await Verify.claim(signedClaim);
+// → { valid: true, errors: [], keyId: 'key-0' }
+
+// Verify a safebox attestation against trusted images
+const attestation = await Verify.safeboxAttestation(claim, {
+  trustedImages: ['abcd1234...'],  // accepted image hashes
+  trustedPCR0: ['ef567890...'],    // accepted PCR0 values
+  maxAgeSec: 3600                  // reject claims older than 1 hour
+});
+// → { valid: true, safeboxUri: 'safebox://...', pcr0, pcr1, pcr4, imageHash, endpoints, capabilities }
+
+// Verify a publication with Merkle root check
+const pub = await Verify.publication(signedPubClaim, {
+  files: [{ path: 'index.js', content: '...' }, ...]
+});
+// → { valid: true, merkleVerified: true, package: 'ns/pkg@1.0.0' }
+
+// Fetch and verify a live safebox
+const live = await Verify.fetchAndVerify('https://safebox.example.com:8443', {
+  trustedImages: ['abcd1234...']
+});
+
+// Check revocation
+const revoked = await Verify.isRevoked(claim, revokedHashSet);
+
+// Verify transparency log inclusion proof
+const ok = await Verify.inclusionProof(entryHash, proof, rootHash);
+```
+
+### API
+
+| Method | Description |
+|--------|-------------|
+| `Verify.claim(claim, opts?)` | Verify ES256 signature on any OCP claim |
+| `Verify.safeboxAttestation(claim, opts?)` | Verify safebox identity (signature + PCR + image trust) |
+| `Verify.publication(claim, opts?)` | Verify publication claim (signature + optional Merkle root) |
+| `Verify.auditAttestation(claim, opts?)` | Verify audit attestation (signature + expiry + auditor trust) |
+| `Verify.fetchAndVerify(endpoint, opts?)` | Fetch + verify a live safebox's identity endpoint |
+| `Verify.inclusionProof(hash, proof, root)` | Verify a Merkle inclusion proof |
+| `Verify.merkleRoot(hashes)` | Compute Merkle root from leaf hashes |
+| `Verify.isRevoked(claim, revokedSet)` | Check if a claim hash is in a revocation set |
+| `Verify.claimHash(claim)` | Compute SHA-256 of canonicalJSON(claim.stm) |
+| `Verify.validateStructure(claim)` | Validate OCP envelope structure (no crypto) |
+| `Verify.canonicalJSON(value)` | RFC 8785 / JCS canonical JSON serialization |
+| `Verify.sha256hex(data)` | SHA-256 hex digest via SubtleCrypto |
+
+---
+
 ## Development
 
 ### Run Tests
@@ -605,7 +785,10 @@ The governance quorum publishes `image_blessing` claims that approve specific im
 npm test
 ```
 
-159 TAP tests covering all modules: identity, registry (Prolly tree), publication (manifests + Merkle), discovery (gossip + Bloom), payments (ledger + settlement), transparency log (append + consistency proofs), claims (all 14 types), git receiver, CLI, and HTTP routing. 154 tests run with built-in crypto fallbacks; 5 additional tests require `Q.Crypto` / `Q.Data` and skip gracefully without them.
+210 TAP tests across two suites:
+
+- **testSafenet.js** (159 tests) — identity, registry (Prolly tree), publication (manifests + Merkle), discovery (gossip + Bloom), payments (ledger + settlement), transparency log (append + consistency proofs), claims (all 15 types), git receiver, CLI, and HTTP routing. 154 run with built-in crypto fallbacks; 5 require Q.Crypto / Q.Data and skip gracefully.
+- **testVerify.js** (51 tests) — end-to-end cryptographic verification: real P-256 keypair generation → OCP claim signing → signature verification, safebox attestation, publication Merkle root, audit attestation expiry, DER/P1363 signature conversion, revocation checking, Merkle proof verification, cross-compatibility with utils.js canonicalJSON/claimHash. Uses only Web Crypto API (no Q dependency).
 
 ### Project Structure
 
@@ -616,14 +799,17 @@ npm test
 | `lib/Payments.js` | 799 | Safebux ledger + EVM settlement |
 | `lib/GitReceiver.js` | 621 | Git Smart HTTP protocol |
 | `lib/Discovery.js` | 620 | Gossip + Bloom sync |
-| `lib/Registry.js` | 547 | Prolly-tree-backed registry |
+| `lib/Registry.js` | 750+ | Prolly-tree-backed registry (NAME/BOX_ANNOUNCE prefixes) |
 | `lib/TransparencyLog.js` | 491 | Append-only Merkle log |
-| `lib/Claims.js` | 473 | 14 OCP claim type factories |
+| `lib/Claims.js` | 567 | 17 OCP claim type factories (includes name_claim, safebox_announce) |
+| `lib/ZoneCompiler.js` | 271 | Pure-function DNS zone compiler |
+| `lib/Verify.js` | 530 | Client-side verification (isomorphic Node+browser) |
 | `lib/Publisher.js` | 402 | Manifest validation + encryption |
 | `lib/Identity.js` | 373 | Identity generation + verification |
 | `lib/utils.js` | 163 | SHA-256, canonicalization, semver |
 | `test/testSafenet.js` | 1,730 | 159 TAP tests |
-| **Total** | **~9,600** | |
+| `test/testVerify.js` | 490 | 51 TAP tests (end-to-end crypto) |
+| **Total** | **~10,600** | |
 
 ### Environment Variables
 

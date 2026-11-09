@@ -6,9 +6,16 @@
   "bin": {
     "safenet": "./cli.js"
   },
+  "exports": {
+    ".": "./lib/SafenetNode.js",
+    "./verify": "./lib/Verify.js",
+    "./claims": "./lib/Claims.js",
+    "./identity": "./lib/Identity.js"
+  },
   "scripts": {
     "start": "node server.js",
-    "test": "node test/testSafenet.js",
+    "test": "node test/testSafenet.js && node test/testVerify.js",
+    "test:verify": "node test/testVerify.js",
     "lint": "echo 'No linter configured'"
   },
   "keywords": ["safenet", "safebox", "openclaiming", "ocp", "distributed", "registry", "package-manager"],

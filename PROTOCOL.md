@@ -215,6 +215,90 @@ Each Safebox maintains a set of acceptable image hashes (disk images that are co
 
 Verified against the governance key registry with the `system` threshold.
 
+### 3.4 Per-Topic Auditor Trust
+
+Image blessing (§3.3) provides a global base layer: governance approves a disk image, and any Safebox running that image passes attestation. Per-topic auditor trust adds a finer-grained layer on top, allowing Safebox operators to require independent audit attestations for specific software domains before accepting a peer.
+
+**Motivation:** A single governance quorum cannot deeply audit every software domain (ML inference, cryptographic libraries, network stacks, etc.). Per-topic trust delegates that responsibility to domain-specific auditors, each holding a key derived from a known auditor root via Q.Crypto.delegate HKDF chains.
+
+#### 3.4.1 Audit Attestation Claim
+
+An auditor publishes a signed claim attesting that a package version (or version range) meets the requirements for a given topic:
+
+```json
+{
+  "ocp": 1,
+  "iss": "safenet:auditor:<auditor-key-hex>",
+  "sub": "safenet:package:<ns>/<name>",
+  "stm": {
+    "type": "audit_attestation",
+    "topic": "safenet.audit.ml-inference",
+    "namespace": "org.safebots",
+    "package": "vllm-runtime",
+    "versionRange": ">=0.4.0 <0.5.0",
+    "assessment": "approved",
+    "auditor": "<auditor-public-key-hex>",
+    "expiry": "2027-06-01T00:00:00Z",
+    "delegationProof": { "...OCP delegation chain..." },
+    "summary": "Reviewed inference pipeline for side-channel resistance"
+  },
+  "nbf": "2026-10-07T...",
+  "key": ["<auditor-key>"],
+  "sig": ["<sig>"]
+}
+```
+
+The `assessment` field is either `"approved"` or `"rejected"`. The `delegationProof` is an OCP delegation chain from the auditor's root key through the topic path, verifiable via `Q.Crypto.verifyDelegated()`.
+
+#### 3.4.2 Topic Trust Policy
+
+Each Safebox operator configures local topic trust policies that define how many auditor attestations are required for each topic and which auditors are trusted:
+
+```yaml
+topic_trust_policies:
+  safenet.audit.ml-inference:
+    required: 2
+    trusted_auditors: [<key_A>, <key_B>, <key_C>]
+    on_missing: warn
+  safenet.audit.crypto:
+    required: 3
+    trusted_auditors: [<key_D>, <key_E>, <key_F>, <key_G>]
+    on_missing: block
+  "*":
+    required: 1
+    trusted_auditors: [...]
+    on_missing: warn
+```
+
+The `on_missing` field controls what happens when insufficient attestations exist. When absent or null, defaults to `"warn"` (log a warning but allow the handshake). When set to `"block"`, the Safebox rejects the peer during mutual attestation.
+
+#### 3.4.3 Attestation Check (Step 2.5)
+
+During mutual attestation (§3.1), after PCR/image verification (step 2) and before the challenge-response (step 3), the Safebox checks per-topic audit attestations:
+
+1. Extract the peer's declared topics/capabilities from its identity claim.
+2. For each topic, look up the local trust policy (falling back to the `"*"` wildcard if no topic-specific policy exists).
+3. Query the registry for matching `audit_attestation` claims where the auditor is in the policy's `trusted_auditors` list, the assessment is `"approved"`, and the claim has not expired or been revoked.
+4. If the number of matching attestations is less than the policy's `required` threshold: if `on_missing` is `"block"`, reject the handshake; otherwise log a warning.
+
+This check is purely additive — a Safebox with no `topicTrustPolicies` configured skips step 2.5 entirely, preserving backward compatibility.
+
+#### 3.4.4 Auditor Key Derivation
+
+Auditor topic keys are derived via chained HKDF delegation from an auditor root secret:
+
+```
+auditorRootSecret
+  → Q.Crypto.delegate("safenet.audit")
+    → auditSecret
+      → Q.Crypto.delegate("safenet.audit.ml-inference")
+        → mlInferenceAuditSecret (keypair for signing ml-inference attestations)
+      → Q.Crypto.delegate("safenet.audit.crypto")
+        → cryptoAuditSecret (keypair for signing crypto attestations)
+```
+
+Each derived key can only sign attestations for its specific topic. The delegation chain is included in the `delegationProof` field, allowing any verifier to trace back to the auditor's root key.
+
 ---
 
 ## 4. Package Registry
@@ -226,11 +310,14 @@ The registry state is a Prolly tree (probabilistic B-tree) mapping package ident
 **Prolly tree key space:**
 
 ```
-namespace:<name>                → NamespaceClaim
-package:<namespace>/<name>      → PackageMetadata
-version:<namespace>/<name>@<v>  → PublicationClaim
-author:<name>                   → AuthorIdentityClaim
-revocation:<hash>               → RevocationClaim
+namespace:<name>                                   → NamespaceClaim
+package:<namespace>/<name>                         → PackageMetadata
+version:<namespace>/<name>@<v>                     → PublicationClaim
+author:<name>                                      → AuthorIdentityClaim
+revocation:<hash>                                  → RevocationClaim
+audit:<topic>:<auditor>:<namespace>/<package>       → AuditAttestationClaim
+safebox_announce:<safeboxId>                       → BoxAnnounceClaim
+name_claim:<name>                                  → NameClaim
 ```
 
 **Root hash:** The Prolly tree root hash is the canonical identifier for the registry state at a point in time. Peers compare root hashes to detect divergence.
@@ -766,6 +853,9 @@ Every Safenet peer exposes:
 | `peer_announce` | Safebox | Safebox | Announce network presence |
 | `trust` | Safebox | Safebox | Establish trust relationship |
 | `namespace_transfer` | Author/Org | Namespace | Transfer namespace ownership |
+| `audit_attestation` | Auditor | Package | Attest that a package meets topic requirements |
+| `safebox_announce` | Safebox (Ed25519) | Safebox | Announce box ID, IP, attestation on boot |
+| `name_claim` | Owner/governance (ES256) | DNS name | Map a name to primary + failover box |
 
 ### 11.2 HTTP API
 
@@ -833,6 +923,14 @@ All Safenet endpoints are under `/safenet/v1/`. Content type is `application/jso
 | GET | `/content/<merkleRoot>/<chunkIndex>` | Download content chunk |
 | GET | `/content/<merkleRoot>/proof/<fileIndex>` | Merkle inclusion proof for a file |
 
+**Audit Attestation:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/audit` | Submit a signed audit attestation claim |
+| GET | `/audit/<topic>` | List all attestations for a topic |
+| GET | `/audit/<topic>/<ns>/<pkg>` | Get attestations for a topic and package |
+
 ---
 
 ## 12. Security Considerations
@@ -847,6 +945,7 @@ All Safenet endpoints are under `/safenet/v1/`. Content type is `application/jso
 | Eclipse attack on registry | Prolly tree root comparison across multiple peers. Consistency proofs. |
 | Payment replay | Unique `installId` per payment. Timestamp bounds (`nbf`/`exp`). |
 | Man-in-the-middle | TLS 1.3 with pinned Safebox certificates. OCP claim verification independent of transport. |
+| Compromised auditor key | Per-topic HKDF derivation limits blast radius to one topic. M-of-N auditor policies (requiring multiple independent attestations) prevent a single compromised auditor from approving malicious packages. Key revocation propagates via gossip (fanout 6, all-peers + TTL 16). |
 | Quantum threat | AES-256-GCM and HKDF-SHA256 are quantum-safe. P-256 ECDH is not — upgrade path: swap to ML-KEM (Kyber) for key exchange. Signatures: upgrade to ML-DSA (Dilithium) or SLH-DSA (SPHINCS+). OCP key URI scheme supports new algorithms via new `data:key/<algorithm>` media types. |
 
 ### 12.2 Rate Limiting
@@ -868,6 +967,7 @@ Every claim must pass before being accepted into the registry:
 6. The signer must be authorized for the claim type (e.g., only namespace owners can publish to their namespace).
 7. The claim must not be revoked.
 8. For governance claims, the governance threshold must be met.
+9. For `audit_attestation` claims, the auditor's delegation chain must be verifiable via `Q.Crypto.verifyDelegated()`, and the topic path in the chain must match `stm.topic`.
 
 ---
 
@@ -884,6 +984,190 @@ New claim types can be introduced without protocol version bumps. Unknown claim 
 ### 13.3 Cryptographic Agility
 
 The OCP key URI scheme (`data:key/<algorithm>;base64,<value>`) provides cryptographic agility. New algorithms can be added (e.g., `data:key/ml-dsa65;base64,<pk>` for post-quantum signatures) without changing the wire format.
+
+---
+
+## 14. DNS Nameserver
+
+### 14.1 Overview
+
+Safenet provides authoritative DNS for the `safenet.org` zone, mapping human-readable names to box IP addresses. The DNS layer is built from two OCP claim types that flow through the standard registry gossip protocol, and a deterministic zone compiler that any party can run independently.
+
+### 14.2 Box Announce Claim
+
+Every Safebox publishes a `safebox_announce` claim on boot and periodically thereafter. This claim is signed with the box's Ed25519 key (distinct from the ES256 keys used for other Safenet claims):
+
+```json
+{
+  "ocp": 1,
+  "iss": "safebox://<box-id>",
+  "sub": "safebox://<box-id>",
+  "stm": {
+    "type": "safebox_announce",
+    "safeboxId": "<box-id>",
+    "publicIp": "203.0.113.10",
+    "attestedAt": "2026-10-07T14:30:00Z",
+    "acmeAccountUri": "https://acme-v02.api.letsencrypt.org/acme/acct/12345",
+    "capabilities": ["registry", "nameserver", "mirror"]
+  },
+  "key": ["data:key/ed25519;base64,<pk>"],
+  "sig": ["<ed25519-sig>"]
+}
+```
+
+**Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `safeboxId` | string | yes | Box identity (SPKI hash) |
+| `publicIp` | string | yes | Routable IPv4 or IPv6 address |
+| `attestedAt` | ISO 8601 | yes | Timestamp of last attestation |
+| `acmeAccountUri` | string | no | ACME account for TLS certificate issuance |
+| `capabilities` | string[] | no | Services this box provides |
+
+Box announces are stored in the registry Prolly tree under the `safebox_announce:<safeboxId>` key prefix.
+
+### 14.3 Name Claim
+
+A `name_claim` maps a human-readable DNS name to a primary Safebox and an optional failover Safebox. Signed by the name owner (an author or governance key) using ES256:
+
+```json
+{
+  "ocp": 1,
+  "iss": "safenet:author:alice",
+  "sub": "safenet:name:myapp.safenet.org",
+  "stm": {
+    "type": "name_claim",
+    "name": "myapp.safenet.org",
+    "safeboxId": "<primary-box-id>",
+    "failoverSafeboxId": "<failover-box-id>",
+    "claimedAt": "2026-10-07T14:30:00Z"
+  },
+  "key": ["data:key/es256;base64,<owner-spki>"],
+  "sig": ["<es256-sig>"]
+}
+```
+
+**Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Fully qualified domain name |
+| `safeboxId` | string | yes | Primary box to resolve to |
+| `failoverSafeboxId` | string | no | Backup box if primary stops attesting |
+| `claimedAt` | ISO 8601 | yes | When the name was claimed |
+
+**Conflict resolution:** Same as namespace claims — first-come-first-served with timestamp tie-breaking.
+
+Name claims are stored in the registry Prolly tree under the `name_claim:<name>` key prefix.
+
+### 14.4 Zone Compilation
+
+The zone compiler is a pure function: given the same registry state, it always produces the same DNS zone file. This is the core property that allows independent verification.
+
+**Algorithm:**
+
+```
+compile(registry, config) → zone_file
+
+  1. Read all name_claims from registry
+  2. Read all safebox_announces from registry
+  3. Derive SOA serial from registry Prolly tree root hash:
+       serial = parseInt(rootHash.slice(0, 8), 16)
+  4. Emit $ORIGIN, $TTL, SOA record
+  5. Emit NS records for configured nameservers
+  6. Emit CAA records (restrict certificate issuance)
+  7. Emit static records (MX, TXT, etc.)
+  8. For each name_claim (sorted alphabetically):
+       a. Look up primary box in safebox_announces
+       b. Check attestation freshness: (now - attestedAt) ≤ attestationMaxAge
+       c. If primary fresh → emit A/AAAA pointing to primary IP
+       d. If primary stale and failover fresh → emit A/AAAA pointing to failover IP
+       e. If both stale → emit A with STALE warning comment
+       f. If no box found → emit OFFLINE comment only
+```
+
+**Attestation freshness:** A box is considered "fresh" if `(now - attestedAt) ≤ attestationMaxAge`. Default `attestationMaxAge` is 600 seconds (10 minutes).
+
+**SOA serial derivation:** The serial is the first 8 hex characters of the Prolly tree root hash, parsed as a 32-bit unsigned integer. This ensures all nameservers with the same registry state produce the same serial. If no root hash exists (empty registry), a date-based serial `YYYYMMDD01` is used.
+
+### 14.5 Automatic Failover
+
+Failover is entirely driven by attestation freshness. When a box stops attesting (crashes, loses network, fails integrity check), its `attestedAt` timestamp ages past the `attestationMaxAge` threshold. On the next zone compilation cycle (every 60 seconds), the zone compiler:
+
+1. Detects the primary box is stale
+2. Checks if a failover box is declared and fresh
+3. If yes, emits the A record pointing to the failover IP
+4. Knot DNS reloads the zone, and within one TTL (default 300s), all resolvers pick up the new address
+
+No human intervention is required. When the primary box comes back online and publishes a fresh `safebox_announce`, it is restored on the next compilation cycle.
+
+### 14.6 DNSSEC
+
+Each nameserver generates its own DNSSEC keys inside its TPM, following the RFC 8901 multi-signer model:
+
+**Key generation (first boot):**
+1. Initialize `tpm2-pkcs11` store at `/var/lib/safebox/knot/pkcs11`
+2. Generate KSK (ECDSAP256SHA256) via `keymgr` using PKCS#11 keystore
+3. Generate ZSK (ECDSAP256SHA256) via `keymgr` using PKCS#11 keystore
+4. Extract DS records to `/var/lib/safebox/knot/keys/ds-records.txt`
+5. DS records must be submitted to the parent registry (PIR for `.org`)
+
+**Key properties:**
+
+| Property | Value |
+|----------|-------|
+| Algorithm | ECDSAP256SHA256 (algorithm 13) |
+| KSK lifetime | Indefinite (manual rollover) |
+| ZSK lifetime | 30 days (automatic rollover by Knot) |
+| NSEC3 | Enabled (prevents zone enumeration) |
+| Key storage | PKCS#11 via `tpm2-pkcs11` |
+
+**Multi-signer model:** Each nameserver holds its own key pair. The parent zone (.org) carries DS records for all nameservers. Resolvers accept signatures from any of them. No key material is shared between nameservers.
+
+**PIR registry lock:** Out-of-band verification is recommended for NS/DS changes at the .org registry to prevent unauthorized delegation changes.
+
+### 14.7 CAA Records
+
+Certificate Authority Authorization (RFC 8659) records restrict which CAs can issue TLS certificates for names in the zone:
+
+```dns
+@  IN  CAA  0 issue "<issuer>"
+@  IN  CAA  0 issuewild "<issuer>"
+@  IN  CAA  0 iodef "mailto:caa@safenet.org"
+```
+
+Default issuer: `letsencrypt.org`. Configurable via the `caaIssuers` option.
+
+### 14.8 Delegation Health Monitoring
+
+A delegation monitor runs on each nameserver (every 6 hours) and checks:
+
+1. **NS records at parent** — The NS records returned by the .org authoritative servers match the expected set.
+2. **DS records at parent** — All local KSK key tags appear in the parent's DS record set.
+3. **Serial consistency** — All nameservers report the same SOA serial (i.e., they have the same registry state).
+4. **Certificate Transparency** — Queries `crt.sh` for recently issued certificates and logs any unexpected issuance.
+
+Results are logged via syslog with priority `daemon.info` (success), `daemon.warning` (non-critical issues), or `daemon.crit` (delegation problems).
+
+### 14.9 Infrastructure Integration
+
+The nameserver runs as a host-level service in the measured base image:
+
+| Component | Location | Owner |
+|-----------|----------|-------|
+| Knot DNS | `safebox-knot.service` | `safebox-nameserver` (uid 994) |
+| Zone compiler | `safebox-zone-compiler.timer` (every 60s) | `safebox-nameserver` |
+| DNSSEC keygen | `safebox-dnssec-keygen.service` (first boot) | `safebox-nameserver` |
+| Delegation monitor | `safebox-delegation-monitor.timer` (every 6h) | `safebox-nameserver` |
+| Compiled zone | `/var/lib/safebox/knot/zones/safenet.org.zone` | — |
+| TPM keys | `/var/lib/safebox/knot/pkcs11/` | — |
+
+All units `BindsTo=safebox-nameserver-role.target`, so they only run on boxes designated as nameservers. The role target is activated at runtime, not at image build time.
+
+**Firewall:** Port 53 (TCP + UDP) is open on all boxes for simplicity; the Knot service only starts on nameserver-role boxes.
+
+**Security isolation:** `safebox-nameserver` (uid 994) is a dedicated service account, separate from `safebox-infra` (uid 990), because the nameserver is internet-facing on port 53 and holds DNSSEC key material. Each service has `NoNewPrivileges=true`, `ProtectSystem=strict`, and `ProtectHome=true`.
 
 ---
 
@@ -923,7 +1207,16 @@ rootSecret (per Safebox)
        │    ├── HKDF(info="chunk:1")         → Chunk 1 key
        │    └── ...
        └── ...
+
+auditorRootSecret (per auditor)
+  └── Q.Crypto.delegate("safenet.audit")   → Audit master key
+       ├── delegate("safenet.audit.ml-inference")   → ML inference audit key
+       ├── delegate("safenet.audit.crypto")         → Crypto audit key
+       ├── delegate("safenet.audit.network")        → Network audit key
+       └── ...
 ```
+
+The auditor key tree uses `Q.Crypto.delegate()` (HKDF-SHA256 with `info="q.crypto.delegate.<label>"`), the same delegation ceremony used by Safecloud for encryption key derivation. Each derived key can only sign audit attestation claims for its specific topic. The delegation proof included in each claim allows any verifier to trace the chain back to the auditor's root public key.
 
 ## Appendix D: Safenet URIs
 
@@ -934,6 +1227,8 @@ safenet:org:<name>                       — Organization identity
 safenet:namespace:<name>                 — Namespace
 safenet:pkg:<namespace>/<name>           — Package (latest)
 safenet:pkg:<namespace>/<name>@<version> — Package version
+safenet:auditor:<key-hex>                — Auditor identity (root public key)
+safenet:name:<fqdn>                      — DNS name claim
 safenet:governance                       — Governance quorum
 safenet:images                           — Approved image set
 ```
